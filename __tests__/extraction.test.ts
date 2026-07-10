@@ -145,6 +145,11 @@ describe('Language Detection', () => {
     expect(detectLanguage('Program.cs')).toBe('csharp');
   });
 
+  it('should detect F# files', () => {
+    expect(detectLanguage('Program.fs')).toBe('fsharp');
+    expect(detectLanguage('build.fsx')).toBe('fsharp');
+  });
+
   it('should detect PHP files', () => {
     expect(detectLanguage('index.php')).toBe('php');
   });
@@ -14604,5 +14609,340 @@ describe('C++ COM interface declarations (#1519)', () => {
     const expected = source.replace('interface IDerived', 'struct    IDerived').replace('interface IStandalone', 'struct    IStandalone');
     expect(cppExtractor.preParse!(source, 'com.hpp')).toBe(expected);
     expect(Buffer.byteLength(expected)).toBe(Buffer.byteLength(source));
+  });
+});
+
+describe('F# Extraction', () => {
+  describe('Language detection', () => {
+    it('should report F# as supported', () => {
+      expect(isLanguageSupported('fsharp')).toBe(true);
+      expect(getSupportedLanguages()).toContain('fsharp');
+      expect(isSourceFile('src/App/Program.fs')).toBe(true);
+      expect(isSourceFile('build.fsx')).toBe(true);
+    });
+  });
+
+  describe('Function and value extraction', () => {
+    it('should extract let-bound functions with signature and qualified name', () => {
+      const code = `module App.Core
+
+let compute (x: int) (y: int) : int =
+    x + y
+`;
+      const result = extractFromSource('Core.fs', code);
+      const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'compute');
+      expect(fn).toBeDefined();
+      expect(fn?.language).toBe('fsharp');
+      expect(fn?.qualifiedName).toBe('App.Core::compute');
+      expect(fn?.signature).toContain('(x: int)');
+    });
+
+    it('should extract module-level values as constants and mutable bindings as variables', () => {
+      const code = `module App.Values
+
+let timeout = 30
+let mutable counter = 0
+let mutableFlagLookalike = 1
+`;
+      const result = extractFromSource('Values.fs', code);
+      const timeout = result.nodes.find((n) => n.name === 'timeout');
+      expect(timeout?.kind).toBe('constant');
+      const counter = result.nodes.find((n) => n.name === 'counter');
+      expect(counter?.kind).toBe('variable');
+      // a name starting with "mutable" must not be misread as a mutable binding
+      const lookalike = result.nodes.find((n) => n.name === 'mutableFlagLookalike');
+      expect(lookalike?.kind).toBe('constant');
+    });
+
+    it('should not create nodes for function-local let bindings', () => {
+      const code = `module App.Local
+
+let outer () =
+    let localValue = 1
+    let localHelper x = x + localValue
+    localHelper 2
+`;
+      const result = extractFromSource('Local.fs', code);
+      expect(result.nodes.find((n) => n.name === 'localValue')).toBeUndefined();
+      // local calls still attribute to the enclosing function
+      const calls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && r.referenceName === 'localHelper'
+      );
+      expect(calls.length).toBeGreaterThan(0);
+    });
+
+    it('should record visibility from access modifiers', () => {
+      const code = `module App.Vis
+
+let private secret = 42
+let internal helper x = x + secret
+`;
+      const result = extractFromSource('Vis.fs', code);
+      expect(result.nodes.find((n) => n.name === 'secret')?.visibility).toBe('private');
+      expect(result.nodes.find((n) => n.name === 'helper')?.visibility).toBe('internal');
+    });
+  });
+
+  describe('Module and namespace extraction', () => {
+    it('should extract namespaces with nested modules and qualify contents', () => {
+      const code = `namespace My.Company
+
+module Billing =
+
+    let charge amount = amount * 2
+`;
+      const result = extractFromSource('Billing.fs', code);
+      const ns = result.nodes.find((n) => n.kind === 'namespace');
+      expect(ns?.name).toBe('My.Company');
+      const m = result.nodes.find((n) => n.kind === 'module');
+      expect(m?.name).toBe('Billing');
+      const fn = result.nodes.find((n) => n.name === 'charge');
+      expect(fn?.qualifiedName).toBe('My.Company::Billing::charge');
+    });
+  });
+
+  describe('Type extraction', () => {
+    it('should extract records as structs with fields', () => {
+      const code = `module App.Types
+
+type Point = { X: float; Y: float }
+`;
+      const result = extractFromSource('Types.fs', code);
+      const rec = result.nodes.find((n) => n.kind === 'struct');
+      expect(rec?.name).toBe('Point');
+      const fields = result.nodes.filter((n) => n.kind === 'field').map((n) => n.name);
+      expect(fields).toContain('X');
+      expect(fields).toContain('Y');
+    });
+
+    it('should extract discriminated unions as enums with cases', () => {
+      const code = `module App.Types
+
+type Shape =
+    | Circle of float
+    | Rectangle of float * float
+`;
+      const result = extractFromSource('Types.fs', code);
+      const du = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Shape');
+      expect(du).toBeDefined();
+      const cases = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(cases).toContain('Circle');
+      expect(cases).toContain('Rectangle');
+    });
+
+    it('should extract enums with their members', () => {
+      const code = `module App.Types
+
+type Color =
+    | Red = 0
+    | Blue = 1
+`;
+      const result = extractFromSource('Types.fs', code);
+      const en = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Color');
+      expect(en).toBeDefined();
+      const members = result.nodes.filter((n) => n.kind === 'enum_member').map((n) => n.name);
+      expect(members).toContain('Red');
+      expect(members).toContain('Blue');
+    });
+
+    it('should treat a bare single-case union as a type alias', () => {
+      const code = `module App.Types
+
+type Distance = float
+`;
+      const result = extractFromSource('Types.fs', code);
+      const alias = result.nodes.find((n) => n.kind === 'type_alias');
+      expect(alias?.name).toBe('Distance');
+      expect(result.nodes.find((n) => n.kind === 'enum')).toBeUndefined();
+    });
+
+    it('should keep a genuine single-case union with a payload as an enum', () => {
+      const code = `module App.Types
+
+type Meters = Meters of float
+`;
+      const result = extractFromSource('Types.fs', code);
+      const en = result.nodes.find((n) => n.kind === 'enum' && n.name === 'Meters');
+      expect(en).toBeDefined();
+    });
+  });
+
+  describe('Class, interface, and member extraction', () => {
+    it('should extract classes with methods, properties, and let-bound fields', () => {
+      const code = `module App.Impl
+
+type Counter(start: int) =
+    let mutable count = start
+    member this.Increment() = count <- count + 1
+    member this.Value = count
+    static member Zero = Counter(0)
+`;
+      const result = extractFromSource('Impl.fs', code);
+      const cls = result.nodes.find((n) => n.kind === 'class');
+      expect(cls?.name).toBe('Counter');
+      const inc = result.nodes.find((n) => n.kind === 'method');
+      expect(inc?.name).toBe('Increment');
+      expect(inc?.qualifiedName).toBe('App.Impl::Counter::Increment');
+      // receiver prefix must be stripped from property names too
+      const value = result.nodes.find((n) => n.kind === 'property' && n.name === 'Value');
+      expect(value).toBeDefined();
+      const field = result.nodes.find((n) => n.kind === 'field');
+      expect(field?.name).toBe('count');
+    });
+
+    it('should classify abstract-member types as interfaces', () => {
+      const code = `module App.Contracts
+
+type IRenderer =
+    abstract member Render: string -> string
+`;
+      const result = extractFromSource('Contracts.fs', code);
+      const iface = result.nodes.find((n) => n.kind === 'interface');
+      expect(iface?.name).toBe('IRenderer');
+      const m = result.nodes.find((n) => n.kind === 'method' && n.name === 'Render');
+      expect(m?.qualifiedName).toBe('App.Contracts::IRenderer::Render');
+      expect(result.nodes.find((n) => n.kind === 'class')).toBeUndefined();
+    });
+
+    it('should emit implements references and scope interface implementations to the class', () => {
+      const code = `module App.Impl
+
+type IRenderer =
+    abstract member Render: string -> string
+
+type ConsoleRenderer() =
+    interface IRenderer with
+        member _.Render input = input
+`;
+      const result = extractFromSource('Impl.fs', code);
+      const impl = result.unresolvedReferences.find((r) => r.referenceKind === 'implements');
+      expect(impl?.referenceName).toBe('IRenderer');
+      const render = result.nodes.find(
+        (n) => n.kind === 'method' && n.qualifiedName === 'App.Impl::ConsoleRenderer::Render'
+      );
+      expect(render).toBeDefined();
+    });
+
+    it('should record private member visibility and static members', () => {
+      const code = `module App.Impl
+
+type Widget() =
+    member private this.Hidden() = 1
+    static member Create() = Widget()
+`;
+      const result = extractFromSource('Impl.fs', code);
+      const hidden = result.nodes.find((n) => n.name === 'Hidden');
+      expect(hidden?.visibility).toBe('private');
+      const create = result.nodes.find((n) => n.name === 'Create');
+      expect(create?.isStatic).toBe(true);
+    });
+  });
+
+  describe('Import extraction', () => {
+    it('should extract open declarations as imports', () => {
+      const code = `module App.Main
+
+open System.Text
+open My.Company.Billing
+`;
+      const result = extractFromSource('Main.fs', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('System.Text');
+      expect(imports).toContain('My.Company.Billing');
+    });
+  });
+
+  describe('Call extraction', () => {
+    it('should extract direct application calls', () => {
+      const code = `module App.Calls
+
+let helper x = x + 1
+
+let caller () =
+    helper 41
+`;
+      const result = extractFromSource('Calls.fs', code);
+      const calls = result.unresolvedReferences.filter((r) => r.referenceKind === 'calls');
+      expect(calls.map((c) => c.referenceName)).toContain('helper');
+    });
+
+    it('should qualify Module.fn callees for qualified-name resolution', () => {
+      const code = `module App.Calls
+
+let caller () =
+    Validation.check 1
+`;
+      const result = extractFromSource('Calls.fs', code);
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(names).toContain('Validation::check');
+    });
+
+    it('should lift pipe targets into call edges', () => {
+      const code = `module App.Calls
+
+let double x = x * 2
+
+let run xs =
+    xs |> double
+`;
+      const result = extractFromSource('Calls.fs', code);
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(names).toContain('double');
+    });
+
+    it('should synthesize calls to function arguments of function-first combinators', () => {
+      const code = `module App.Calls
+
+let area shape = shape * 2.0
+
+let total shapes =
+    shapes
+    |> List.map area
+    |> List.sum
+`;
+      const result = extractFromSource('Calls.fs', code);
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(names).toContain('area');
+    });
+
+    it('should lift Kleisli composition (>=>) operands used in routing tables', () => {
+      const code = `module App.Routing
+
+let requiresAuth = 1
+let indexHandler = 2
+
+let webApp =
+    requiresAuth >=> indexHandler
+`;
+      const result = extractFromSource('Routing.fs', code);
+      const names = result.unresolvedReferences
+        .filter((r) => r.referenceKind === 'calls')
+        .map((r) => r.referenceName);
+      expect(names).toContain('requiresAuth');
+      expect(names).toContain('indexHandler');
+    });
+
+    it('should emit instantiates for new-expressions and skip core noise functions', () => {
+      const code = `module App.Calls
+
+type Logger() =
+    member this.Log m = m
+
+let make () =
+    printfn "creating"
+    new Logger()
+`;
+      const result = extractFromSource('Calls.fs', code);
+      const inst = result.unresolvedReferences.find((r) => r.referenceKind === 'instantiates');
+      expect(inst?.referenceName).toBe('Logger');
+      const names = result.unresolvedReferences.map((r) => r.referenceName);
+      expect(names).not.toContain('printfn');
+    });
   });
 });

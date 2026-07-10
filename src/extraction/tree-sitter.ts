@@ -28,6 +28,7 @@ import { rustImplItemOwner, rustImplTypeName } from './languages/rust';
 import { goAliasTypeNames, goEmbeddedTypeName, goInterfaceMethodTypeNames, goStructFieldTypeNames } from './languages/go';
 import { dartMisparsedGenericCall, dartReceiverOf, isDartTypeName, pushDartTypeAliasRefs, pushDartTypeRefs } from './languages/dart';
 import { cfmlConstructedComponent, cfmlCreatedComponent, isCfIncludeCall } from './languages/cfscript';
+import { fsharpDottedName, FSHARP_HOF_COMBINATORS, FSHARP_CALL_SKIP } from './languages/fsharp';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -5703,6 +5704,92 @@ export class TreeSitterExtractor {
           line: receiverNode.startPosition.row + 1,
           column: receiverNode.startPosition.column,
         });
+      }
+      return;
+    }
+
+    // F#: calls are `application_expression` (the callee is the FIRST NAMED
+    // CHILD — the grammar has no `function` field) and pipe/composition
+    // `infix_expression`s. A `Module.fn` callee (PascalCase qualifier) is
+    // emitted as `Module::fn` — byte-identical to the qualifiedName the module
+    // container gives every binding (the Erlang trick), so it resolves via
+    // matchByQualifiedName; a camelCase qualifier (`logger.Log`) stays dotted
+    // for receiver-style resolution. `x |> f` / `f <| x` / `f >> g` / Giraffe's
+    // `>=>` lift their function operands into `calls` edges, and function-first
+    // combinators (`List.map area xs`) additionally emit a call to their
+    // function ARGUMENT (the F# analog of Haskell's higher-order synthesis).
+    if (this.language === 'fsharp') {
+      const line = node.startPosition.row + 1;
+      const column = node.startPosition.column;
+      const emitFsCall = (rawName: string | null, kind: 'calls' | 'instantiates' = 'calls'): void => {
+        if (!rawName || FSHARP_CALL_SKIP.has(rawName)) return;
+        const referenceName =
+          rawName.includes('.') && /^[A-Z]/.test(rawName)
+            ? rawName.split('.').join('::')
+            : rawName;
+        this.unresolvedReferences.push({
+          fromNodeId: callerId,
+          referenceName,
+          referenceKind: kind,
+          line,
+          column,
+        });
+      };
+      // Name of a pipe-target operand: a bare/dotted identifier, or the callee
+      // of a partial application (`x |> List.map f` → List.map).
+      const pipeTargetName = (n: SyntaxNode | null): string | null => {
+        if (!n) return null;
+        const direct = fsharpDottedName(n, this.source);
+        if (direct) return direct;
+        if (n.type === 'application_expression') {
+          return fsharpDottedName(n.namedChild(0), this.source);
+        }
+        return null;
+      };
+
+      if (node.type === 'application_expression') {
+        const fn = node.namedChild(0);
+        let callee = fsharpDottedName(fn, this.source);
+        // `shapes |> List.map area` parses as application(infix(shapes |> List.map), area):
+        // the real callee is the pipe's right operand.
+        if (!callee && fn?.type === 'infix_expression') {
+          const op = fn.namedChildren.find((c: SyntaxNode) => c.type === 'infix_op');
+          const opText = op ? getNodeText(op, this.source) : '';
+          if (opText === '|>' || opText === '||>' || opText === '|||>') {
+            callee = pipeTargetName(fn.namedChild(fn.namedChildCount - 1));
+          }
+        }
+        if (!callee) return;
+        // `new Logger()` — the application is wrapped in a `new`-prefixed expression.
+        const isNew =
+          node.parent?.type === 'prefixed_expression' &&
+          getNodeText(node.parent, this.source).startsWith('new');
+        emitFsCall(callee, isNew ? 'instantiates' : 'calls');
+        // Higher-order synthesis: `List.map area xs` calls `area`.
+        if (FSHARP_HOF_COMBINATORS.has(callee)) {
+          const arg = node.namedChild(1);
+          const argName = fsharpDottedName(arg, this.source);
+          if (argName && !FSHARP_CALL_SKIP.has(argName)) emitFsCall(argName);
+        }
+        return;
+      }
+
+      if (node.type === 'infix_expression') {
+        const op = node.namedChildren.find((c: SyntaxNode) => c.type === 'infix_op');
+        if (!op) return;
+        const opText = getNodeText(op, this.source);
+        const lhs = node.namedChild(0);
+        const rhs = node.namedChild(node.namedChildCount - 1);
+        if (opText === '|>' || opText === '||>' || opText === '|||>') {
+          emitFsCall(pipeTargetName(rhs));
+        } else if (opText === '<|' || opText === '<||' || opText === '<|||') {
+          emitFsCall(pipeTargetName(lhs));
+        } else if (opText === '>>' || opText === '<<' || opText === '>=>') {
+          // Composition: both operands are functions the enclosing scope invokes.
+          emitFsCall(pipeTargetName(lhs));
+          emitFsCall(pipeTargetName(rhs));
+        }
+        return;
       }
       return;
     }

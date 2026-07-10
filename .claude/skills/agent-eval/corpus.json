@@ -585,6 +585,29 @@
       "question": "In the OrangeShopping sample app, how does the product detail page's bottom bar (add to cart / buy) lead to the order placement flow? Trace from the bottom navigation component to where the order is created."
     }
   ],
+  "F#": [
+    {
+      "name": "Giraffe",
+      "repo": "https://github.com/giraffe-fsharp/Giraffe",
+      "size": "Small",
+      "files": "~48",
+      "question": "How does an incoming HTTP request reach a route handler? Trace the flow from the ASP.NET Core middleware entry point through HttpHandler composition (>=>) and choose/route to a matched handler."
+    },
+    {
+      "name": "fantomas",
+      "repo": "https://github.com/fsprojects/fantomas",
+      "size": "Medium",
+      "files": "~194",
+      "question": "How does Fantomas turn F# source text into formatted output? Trace the pipeline from the CodeFormatter entry point through parsing and the intermediate tree to the final printed code."
+    },
+    {
+      "name": "fsharp-compiler",
+      "repo": "https://github.com/dotnet/fsharp",
+      "size": "Large",
+      "files": "~6000",
+      "question": "How does the F# compiler surface a type-checking error to the user? Trace the flow from expression type checking to where diagnostics are collected and reported."
+    }
+  ],
   "Nix": [
     {
       "name": "agenix",
